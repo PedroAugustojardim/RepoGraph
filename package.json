@@ -16,6 +16,10 @@
       {
         "command": "repograph.helloWorld",
         "title": "Hello World"
+      },
+      {
+        "command": "repograph.addRepository",
+        "title": "RepoGraph: Adicionar repositório"
       }
     ]
   },
