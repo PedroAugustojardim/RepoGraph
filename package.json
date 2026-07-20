@@ -29,7 +29,15 @@
         "command": "repograph.configureMcp",
         "title": "RepoGraph: Configurar integração MCP (IA)"
       }
-    ]
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "repograph.repositoriesView",
+          "name": "RepoGraph: Repositórios"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
