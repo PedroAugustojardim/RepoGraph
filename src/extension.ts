@@ -50,6 +50,8 @@ class RepositoryTreeProvider implements vscode.TreeDataProvider<string> {
 		item.iconPath = new vscode.ThemeIcon(
 			status === 'indexed' ? 'check' : status === 'error' ? 'error' : 'clock',
 		);
+		item.contextValue = 'repository';
+		item.command = { command: 'repograph.revealOutput', title: 'Ver log', arguments: [] };
 		return item;
 	}
 
@@ -120,6 +122,33 @@ function isEngineInstalled(): Promise<boolean> {
 		child.on('error', () => resolve(false));
 		child.on('close', (code) => resolve(code === 0));
 	});
+}
+
+async function removeRepositoryFlow(
+	context: vscode.ExtensionContext,
+	treeProvider: RepositoryTreeProvider,
+	outputChannel: vscode.OutputChannel,
+	folderPath: string,
+): Promise<void> {
+	const repositories = getRepositories(context);
+	await context.globalState.update(
+		REPOSITORIES_KEY,
+		repositories.filter((repo) => repo !== folderPath),
+	);
+	await clearStatus(context, folderPath);
+	treeProvider.refresh();
+	vscode.window.showInformationMessage(`Repositório removido da lista: ${folderPath}`);
+
+	try {
+		await deleteRepositoryIndex(folderPath, outputChannel);
+		vscode.window.showInformationMessage(`Índice removido do code graph: ${folderPath}`);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		outputChannel.appendLine(`Aviso: não foi possível remover o índice: ${message}`);
+		vscode.window.showWarningMessage(
+			`Repositório removido da lista, mas o índice não pôde ser apagado do code graph: ${message}`,
+		);
+	}
 }
 
 async function warnIfEngineMissing(): Promise<void> {
@@ -221,24 +250,26 @@ export function activate(context: vscode.ExtensionContext) {
 			return;
 		}
 
-		await context.globalState.update(
-			REPOSITORIES_KEY,
-			repositories.filter((repo) => repo !== folderPath),
-		);
-		await clearStatus(context, folderPath);
-		treeProvider.refresh();
-		vscode.window.showInformationMessage(`Repositório removido da lista: ${folderPath}`);
+		await removeRepositoryFlow(context, treeProvider, outputChannel, folderPath);
+	});
 
-		try {
-			await deleteRepositoryIndex(folderPath, outputChannel);
-			vscode.window.showInformationMessage(`Índice removido do code graph: ${folderPath}`);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			outputChannel.appendLine(`Aviso: não foi possível remover o índice: ${message}`);
-			vscode.window.showWarningMessage(
-				`Repositório removido da lista, mas o índice não pôde ser apagado do code graph: ${message}`,
+	const removeRepositoryItem = vscode.commands.registerCommand(
+		'repograph.removeRepositoryItem',
+		async (folderPath: string) => {
+			const confirm = await vscode.window.showWarningMessage(
+				`Remover "${folderPath.split(/[\\/]/).pop()}" do RepoGraph?`,
+				{ modal: true },
+				'Remover',
 			);
-		}
+			if (confirm !== 'Remover') {
+				return;
+			}
+			await removeRepositoryFlow(context, treeProvider, outputChannel, folderPath);
+		},
+	);
+
+	const revealOutput = vscode.commands.registerCommand('repograph.revealOutput', () => {
+		outputChannel.show(true);
 	});
 
 	const configureMcp = vscode.commands.registerCommand('repograph.configureMcp', () => {
@@ -250,7 +281,14 @@ export function activate(context: vscode.ExtensionContext) {
 		terminal.sendText(`${ENGINE_COMMAND} mcp setup`);
 	});
 
-	context.subscriptions.push(disposable, addRepository, removeRepository, configureMcp);
+	context.subscriptions.push(
+		disposable,
+		addRepository,
+		removeRepository,
+		removeRepositoryItem,
+		revealOutput,
+		configureMcp,
+	);
 }
 
 // This method is called when your extension is deactivated

@@ -44,6 +44,16 @@
       {
         "command": "repograph.configureMcp",
         "title": "RepoGraph: Configurar integração MCP (IA)"
+      },
+      {
+        "command": "repograph.removeRepositoryItem",
+        "title": "RepoGraph: Remover este repositório",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "repograph.revealOutput",
+        "title": "RepoGraph: Ver log",
+        "icon": "$(output)"
       }
     ],
     "views": {
@@ -52,6 +62,19 @@
           "id": "repograph.repositoriesView",
           "name": "RepoGraph: Repositórios"
         }
+      ]
+    },
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "repograph.removeRepositoryItem",
+          "when": "view == repograph.repositoriesView",
+          "group": "inline"
+        }
+      ],
+      "commandPalette": [
+        { "command": "repograph.removeRepositoryItem", "when": "false" },
+        { "command": "repograph.revealOutput", "when": "false" }
       ]
     }
   },
