@@ -100,6 +100,33 @@ async function deleteRepositoryIndex(folderPath: string, outputChannel: vscode.O
 	outputChannel.appendLine(`Índice removido do code graph: ${folderPath}`);
 }
 
+function isEngineInstalled(): Promise<boolean> {
+	return new Promise((resolve) => {
+		const child = spawn(ENGINE_COMMAND, ['--version'], { shell: false });
+		child.on('error', () => resolve(false));
+		child.on('close', (code) => resolve(code === 0));
+	});
+}
+
+async function warnIfEngineMissing(): Promise<void> {
+	if (await isEngineInstalled()) {
+		return;
+	}
+
+	const choice = await vscode.window.showWarningMessage(
+		'CodeGraphContext (comando "cgc") não foi encontrado nesta máquina. O RepoGraph precisa dele instalado para indexar repositórios.',
+		'Copiar comando de instalação',
+		'Abrir documentação',
+	);
+
+	if (choice === 'Copiar comando de instalação') {
+		await vscode.env.clipboard.writeText('pip install codegraphcontext');
+		vscode.window.showInformationMessage('Comando copiado: pip install codegraphcontext');
+	} else if (choice === 'Abrir documentação') {
+		vscode.env.openExternal(vscode.Uri.parse('https://github.com/CodeGraphContext/CodeGraphContext'));
+	}
+}
+
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
 export function activate(context: vscode.ExtensionContext) {
@@ -113,6 +140,8 @@ export function activate(context: vscode.ExtensionContext) {
 
 	const treeProvider = new RepositoryTreeProvider(context);
 	context.subscriptions.push(vscode.window.registerTreeDataProvider('repograph.repositoriesView', treeProvider));
+
+	void warnIfEngineMissing();
 
 	// The command has been defined in the package.json file
 	// Now provide the implementation of the command with registerCommand
