@@ -10,28 +10,41 @@ function getRepositories(context: vscode.ExtensionContext): string[] {
 	return context.globalState.get<string[]>(REPOSITORIES_KEY, []);
 }
 
-function indexRepository(folderPath: string, outputChannel: vscode.OutputChannel): Promise<void> {
+function runEngineCommand(args: string[], outputChannel: vscode.OutputChannel): Promise<void> {
 	return new Promise((resolve, reject) => {
 		outputChannel.show(true);
-		outputChannel.appendLine(`\n> Indexando: ${folderPath}`);
+		outputChannel.appendLine(`\n> cgc ${args.join(' ')}`);
 
 		// Args passados como array (não concatenados em string) para evitar injeção de comando.
-		const child = spawn(ENGINE_COMMAND, ['index', folderPath], { shell: false });
+		const child = spawn(ENGINE_COMMAND, args, { shell: false });
+		let stderrOutput = '';
 
 		child.stdout.on('data', (data: Buffer) => outputChannel.append(data.toString()));
-		child.stderr.on('data', (data: Buffer) => outputChannel.append(data.toString()));
+		child.stderr.on('data', (data: Buffer) => {
+			stderrOutput += data.toString();
+			outputChannel.append(data.toString());
+		});
 
 		child.on('error', (error) => reject(error));
 
 		child.on('close', (code) => {
 			if (code === 0) {
-				outputChannel.appendLine(`Indexação concluída: ${folderPath}`);
 				resolve();
 			} else {
-				reject(new Error(`cgc index terminou com código ${code}`));
+				reject(new Error(stderrOutput.trim() || `cgc ${args[0]} terminou com código ${code}`));
 			}
 		});
 	});
+}
+
+async function indexRepository(folderPath: string, outputChannel: vscode.OutputChannel): Promise<void> {
+	await runEngineCommand(['index', folderPath], outputChannel);
+	outputChannel.appendLine(`Indexação concluída: ${folderPath}`);
+}
+
+async function deleteRepositoryIndex(folderPath: string, outputChannel: vscode.OutputChannel): Promise<void> {
+	await runEngineCommand(['delete', folderPath], outputChannel);
+	outputChannel.appendLine(`Índice removido do code graph: ${folderPath}`);
 }
 
 // This method is called when your extension is activated
@@ -87,7 +100,41 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 	});
 
-	context.subscriptions.push(disposable, addRepository);
+	const removeRepository = vscode.commands.registerCommand('repograph.removeRepository', async () => {
+		const repositories = getRepositories(context);
+
+		if (repositories.length === 0) {
+			vscode.window.showInformationMessage('Nenhum repositório cadastrado.');
+			return;
+		}
+
+		const folderPath = await vscode.window.showQuickPick(repositories, {
+			placeHolder: 'Escolha o repositório para remover',
+		});
+
+		if (!folderPath) {
+			return;
+		}
+
+		await context.globalState.update(
+			REPOSITORIES_KEY,
+			repositories.filter((repo) => repo !== folderPath),
+		);
+		vscode.window.showInformationMessage(`Repositório removido da lista: ${folderPath}`);
+
+		try {
+			await deleteRepositoryIndex(folderPath, outputChannel);
+			vscode.window.showInformationMessage(`Índice removido do code graph: ${folderPath}`);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			outputChannel.appendLine(`Aviso: não foi possível remover o índice: ${message}`);
+			vscode.window.showWarningMessage(
+				`Repositório removido da lista, mas o índice não pôde ser apagado do code graph: ${message}`,
+			);
+		}
+	});
+
+	context.subscriptions.push(disposable, addRepository, removeRepository);
 }
 
 // This method is called when your extension is deactivated

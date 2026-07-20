@@ -20,6 +20,10 @@
       {
         "command": "repograph.addRepository",
         "title": "RepoGraph: Adicionar repositório"
+      },
+      {
+        "command": "repograph.removeRepository",
+        "title": "RepoGraph: Remover repositório"
       }
     ]
   },
