@@ -7,8 +7,22 @@
     "vscode": "^1.125.0"
   },
   "categories": [
+    "AI",
     "Other"
   ],
+  "keywords": [
+    "mcp",
+    "context",
+    "ai",
+    "code graph",
+    "claude",
+    "cursor",
+    "copilot"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PedroAugustojardim/RepoGraph.git"
+  },
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
