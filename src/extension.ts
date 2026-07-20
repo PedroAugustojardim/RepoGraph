@@ -6,6 +6,7 @@ import { spawn } from 'child_process';
 const REPOSITORIES_KEY = 'repograph.repositories';
 const STATUS_KEY = 'repograph.status';
 const ENGINE_COMMAND = 'cgc';
+const ENGINE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutos
 
 type RepoStatus = 'pending' | 'indexed' | 'error';
 
@@ -71,6 +72,13 @@ function runEngineCommand(args: string[], outputChannel: vscode.OutputChannel): 
 			env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
 		});
 		let stderrOutput = '';
+		let timedOut = false;
+
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			child.kill();
+			outputChannel.appendLine(`\nTempo limite excedido (${ENGINE_TIMEOUT_MS / 1000}s). Processo cancelado.`);
+		}, ENGINE_TIMEOUT_MS);
 
 		child.stdout.on('data', (data: Buffer) => outputChannel.append(data.toString()));
 		child.stderr.on('data', (data: Buffer) => {
@@ -78,10 +86,16 @@ function runEngineCommand(args: string[], outputChannel: vscode.OutputChannel): 
 			outputChannel.append(data.toString());
 		});
 
-		child.on('error', (error) => reject(error));
+		child.on('error', (error) => {
+			clearTimeout(timeout);
+			reject(error);
+		});
 
 		child.on('close', (code) => {
-			if (code === 0) {
+			clearTimeout(timeout);
+			if (timedOut) {
+				reject(new Error(`cgc ${args[0]} excedeu o tempo limite de ${ENGINE_TIMEOUT_MS / 1000}s e foi cancelado.`));
+			} else if (code === 0) {
 				resolve();
 			} else {
 				reject(new Error(stderrOutput.trim() || `cgc ${args[0]} terminou com código ${code}`));
