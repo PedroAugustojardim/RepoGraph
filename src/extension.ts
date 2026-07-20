@@ -134,7 +134,16 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 	});
 
-	context.subscriptions.push(disposable, addRepository, removeRepository);
+	const configureMcp = vscode.commands.registerCommand('repograph.configureMcp', () => {
+		// O motor já fala MCP sozinho (um único servidor cobre todos os repositórios
+		// indexados), então aqui só orientamos o assistente oficial de configuração
+		// em vez de reescrever a lógica de detecção de cliente (VS Code, Cursor, etc.).
+		const terminal = vscode.window.createTerminal('RepoGraph MCP Setup');
+		terminal.show();
+		terminal.sendText(`${ENGINE_COMMAND} mcp setup`);
+	});
+
+	context.subscriptions.push(disposable, addRepository, removeRepository, configureMcp);
 }
 
 // This method is called when your extension is deactivated

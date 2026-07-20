@@ -24,6 +24,10 @@
       {
         "command": "repograph.removeRepository",
         "title": "RepoGraph: Remover repositório"
+      },
+      {
+        "command": "repograph.configureMcp",
+        "title": "RepoGraph: Configurar integração MCP (IA)"
       }
     ]
   },
