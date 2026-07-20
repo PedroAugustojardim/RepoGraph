@@ -3,7 +3,7 @@
   "displayName": "RepoGraph",
   "publisher": "repograph",
   "description": "Central de repositorios para IA: indexa seus projetos com CodeGraphContext (MCP) e da contexto de codigo pronto para Claude Code, Cursor e Copilot.",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "icon": "images/icon.png",
   "engines": {
     "vscode": "^1.125.0"

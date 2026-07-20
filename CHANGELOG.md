@@ -2,6 +2,14 @@
 
 All notable changes to the "RepoGraph" extension will be documented in this file.
 
+## [0.1.0] - 2026-07-20
+
+- Ações inline na barra lateral de repositórios: ícone de **remover** (com confirmação) e clique no item para abrir o Output, sem precisar da paleta de comandos.
+- Novo painel **"Grafo 3D"** (ícone próprio na Activity Bar) com um visualizador 3D nativo do grafo de código de cada repositório indexado, desenhado com cores do próprio tema do VSCode.
+- Comandos **RepoGraph: Visualizar grafo em 3D** (paleta) e o ícone inline correspondente na árvore de repositórios.
+- Correções de robustez descobertas numa revisão de segurança: vazamento de instâncias do renderizador 3D ao trocar de repositório, nomes de nós sem escape na tooltip, validação da resposta do `cgc query`, aviso quando o grafo é grande demais e é truncado, log da consulta no painel de Output, e proteção contra condição de corrida ao trocar de repositório rapidamente.
+- Correção de uma letra de unidade (`C:` vs `c:`) inconsistente entre o VSCode e o CodeGraphContext que travava o banco KuzuDB em vez de simplesmente não retornar resultados.
+
 ## [0.0.1] - 2026-07-20
 
 Versão inicial.
