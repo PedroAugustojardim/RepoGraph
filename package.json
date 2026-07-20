@@ -54,27 +54,67 @@
         "command": "repograph.revealOutput",
         "title": "RepoGraph: Ver log",
         "icon": "$(output)"
+      },
+      {
+        "command": "repograph.visualizeRepository",
+        "title": "RepoGraph: Visualizar grafo em 3D"
+      },
+      {
+        "command": "repograph.visualizeRepositoryItem",
+        "title": "RepoGraph: Visualizar este repositório em 3D",
+        "icon": "$(graph)"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "repograph",
+          "title": "RepoGraph",
+          "icon": "images/activity-icon.svg"
+        }
+      ]
+    },
     "views": {
       "explorer": [
         {
           "id": "repograph.repositoriesView",
           "name": "RepoGraph: Repositórios"
         }
+      ],
+      "repograph": [
+        {
+          "type": "webview",
+          "id": "repograph.graphView",
+          "name": "Grafo 3D"
+        }
       ]
     },
     "menus": {
       "view/item/context": [
         {
+          "command": "repograph.visualizeRepositoryItem",
+          "when": "view == repograph.repositoriesView",
+          "group": "inline@1"
+        },
+        {
           "command": "repograph.removeRepositoryItem",
           "when": "view == repograph.repositoriesView",
-          "group": "inline"
+          "group": "inline@2"
         }
       ],
       "commandPalette": [
-        { "command": "repograph.removeRepositoryItem", "when": "false" },
-        { "command": "repograph.revealOutput", "when": "false" }
+        {
+          "command": "repograph.removeRepositoryItem",
+          "when": "false"
+        },
+        {
+          "command": "repograph.revealOutput",
+          "when": "false"
+        },
+        {
+          "command": "repograph.visualizeRepositoryItem",
+          "when": "false"
+        }
       ]
     }
   },
@@ -93,19 +133,24 @@
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/vscode": "^1.125.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
-    "typescript-eslint": "^8.61.1",
-    "eslint": "^10.5.0",
+    "@types/vscode": "^1.125.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
     "esbuild": "^0.28.1",
+    "eslint": "^10.5.0",
     "npm-run-all": "^4.1.5",
     "typescript": "^6.0.3",
-    "@vscode/test-cli": "^0.0.15",
-    "@vscode/test-electron": "^3.0.0"
+    "typescript-eslint": "^8.61.1"
   },
   "overrides": {
     "diff": "^8.0.4",
     "serialize-javascript": "^7.0.6"
+  },
+  "dependencies": {
+    "3d-force-graph": "^1.80.0",
+    "three": "^0.185.1",
+    "three-spritetext": "^1.10.0"
   }
 }

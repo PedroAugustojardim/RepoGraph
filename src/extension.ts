@@ -10,6 +10,17 @@ const ENGINE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutos
 
 type RepoStatus = 'pending' | 'indexed' | 'error';
 
+interface GraphNode {
+	id: string;
+	type: string;
+}
+
+interface GraphEdge {
+	source: string;
+	target: string;
+	type: string;
+}
+
 function getRepositories(context: vscode.ExtensionContext): string[] {
 	return context.globalState.get<string[]>(REPOSITORIES_KEY, []);
 }
@@ -60,6 +71,72 @@ class RepositoryTreeProvider implements vscode.TreeDataProvider<string> {
 	}
 }
 
+class GraphViewProvider implements vscode.WebviewViewProvider {
+	private view?: vscode.WebviewView;
+	private pendingData?: { nodes: GraphNode[]; edges: GraphEdge[] };
+	private ready = false;
+
+	constructor(private readonly extensionUri: vscode.Uri) {}
+
+	resolveWebviewView(webviewView: vscode.WebviewView): void {
+		this.view = webviewView;
+		this.ready = false;
+		webviewView.webview.options = {
+			enableScripts: true,
+			localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'dist')],
+		};
+		webviewView.webview.onDidReceiveMessage((message: { type?: string }) => {
+			if (message?.type === 'ready') {
+				this.ready = true;
+				if (this.pendingData) {
+					this.post(this.pendingData);
+				}
+			}
+		});
+		webviewView.webview.html = this.buildHtml(webviewView.webview);
+	}
+
+	showGraph(nodes: GraphNode[], edges: GraphEdge[]): void {
+		this.pendingData = { nodes, edges };
+		if (this.view && this.ready) {
+			this.post(this.pendingData);
+		}
+	}
+
+	private post(data: { nodes: GraphNode[]; edges: GraphEdge[] }): void {
+		this.view?.webview.postMessage({ type: 'graph', nodes: data.nodes, edges: data.edges });
+	}
+
+	private buildHtml(webview: vscode.Webview): string {
+		const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'dist', 'webview', 'graph.js'));
+		const nonce = Date.now().toString(36) + Math.random().toString(36).slice(2);
+		return `<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;background:var(--vscode-editor-background);overflow:hidden;color:var(--vscode-foreground);font-family:var(--vscode-font-family);}
+#graph,#empty{width:100%;height:100%;}
+#empty{display:none;align-items:center;justify-content:center;text-align:center;padding:1em;box-sizing:border-box;}
+</style>
+</head>
+<body>
+<div id="graph"></div>
+<div id="empty">Nenhuma relação encontrada para este repositório.</div>
+<script nonce="${nonce}" src="${scriptUri}"></script>
+</body>
+</html>`;
+	}
+}
+
+function friendlyEngineError(stderr: string): string {
+	if (stderr.includes('Could not set lock on file')) {
+		// KuzuDB (banco embutido, tipo SQLite) só aceita uma conexão por vez.
+		return 'O banco de dados está em uso por outra operação do cgc. Tente de novo em alguns segundos.';
+	}
+	return stderr.trim();
+}
+
 function runEngineCommand(args: string[], outputChannel: vscode.OutputChannel): Promise<void> {
 	return new Promise((resolve, reject) => {
 		outputChannel.show(true);
@@ -100,7 +177,7 @@ function runEngineCommand(args: string[], outputChannel: vscode.OutputChannel): 
 			} else if (code === 0) {
 				resolve();
 			} else {
-				reject(new Error(stderrOutput.trim() || `cgc ${args[0]} terminou com código ${code}`));
+				reject(new Error(friendlyEngineError(stderrOutput) || `cgc ${args[0]} terminou com código ${code}`));
 			}
 		});
 	});
@@ -114,6 +191,183 @@ async function indexRepository(folderPath: string, outputChannel: vscode.OutputC
 async function deleteRepositoryIndex(folderPath: string, outputChannel: vscode.OutputChannel): Promise<void> {
 	await runEngineCommand(['delete', folderPath], outputChannel);
 	outputChannel.appendLine(`Índice removido do code graph: ${folderPath}`);
+}
+
+function runQueryCommand(query: string, outputChannel: vscode.OutputChannel): Promise<unknown[]> {
+	return new Promise((resolve, reject) => {
+		outputChannel.appendLine(`\n> cgc query ${query}`);
+
+		// cgc query é um processo de vida curta (como index/delete), diferente do antigo
+		// cgc visualize — não sobe servidor nenhum, então não segura o banco travado.
+		const child = spawn(ENGINE_COMMAND, ['query', query], {
+			shell: false,
+			env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+		});
+		let stdout = '';
+		let stderr = '';
+		let timedOut = false;
+
+		// Guarda contra travas do próprio KuzuDB (ex: comparação de string com a letra
+		// da unidade em caixa diferente da armazenada no banco fez a consulta nunca retornar).
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			child.kill();
+		}, ENGINE_TIMEOUT_MS);
+
+		child.stdout.on('data', (data: Buffer) => {
+			const text = data.toString();
+			stdout += text;
+			outputChannel.append(text);
+		});
+		child.stderr.on('data', (data: Buffer) => {
+			const text = data.toString();
+			stderr += text;
+			outputChannel.append(text);
+		});
+
+		child.on('error', (error) => {
+			clearTimeout(timeout);
+			reject(error);
+		});
+
+		child.on('close', (code) => {
+			clearTimeout(timeout);
+			if (timedOut) {
+				reject(new Error(`cgc query excedeu o tempo limite de ${ENGINE_TIMEOUT_MS / 1000}s e foi cancelado.`));
+				return;
+			}
+			if (code !== 0) {
+				// friendlyEngineError trata os casos conhecidos (ex: banco travado); nos demais
+				// casos a saída bruta já foi logada acima no Output, então nada fica escondido
+				// mesmo quando a mensagem de erro do motor mudar e deixar de bater com o que
+				// reconhecemos aqui.
+				reject(new Error(friendlyEngineError(stderr) || `cgc query terminou com código ${code}`));
+				return;
+			}
+			// O cgc query também imprime linhas de status ("Resolving context...", etc.) no
+			// stdout antes do JSON — extrai só a partir do primeiro '[' em vez de parsear tudo.
+			const jsonStart = stdout.indexOf('[');
+			if (jsonStart === -1) {
+				reject(new Error('Não foi possível interpretar a resposta do cgc query (nenhum JSON encontrado).'));
+				return;
+			}
+			try {
+				resolve(JSON.parse(stdout.slice(jsonStart)));
+			} catch {
+				reject(new Error('Não foi possível interpretar a resposta do cgc query.'));
+			}
+		});
+	});
+}
+
+const GRAPH_DISPLAY_LIMIT = 500;
+
+interface GraphRow {
+	source: string;
+	sourceType: string;
+	relType: string;
+	target: string;
+	targetType: string;
+}
+
+function isGraphRow(row: unknown): row is GraphRow {
+	if (typeof row !== 'object' || row === null) {
+		return false;
+	}
+	const candidate = row as Record<string, unknown>;
+	return (
+		typeof candidate.source === 'string' &&
+		typeof candidate.target === 'string' &&
+		typeof candidate.relType === 'string'
+	);
+}
+
+async function fetchGraphData(
+	folderPath: string,
+	outputChannel: vscode.OutputChannel,
+): Promise<{ nodes: GraphNode[]; edges: GraphEdge[]; truncated: boolean }> {
+	// O CodeGraphContext guarda os caminhos com barra normal e letra de unidade maiúscula
+	// (ex: "C:/Users/..."). O VSCode às vezes entrega o caminho com letra minúscula
+	// (ex: "c:\Users\...") — sem essa normalização, a comparação STARTS WITH nunca bate
+	// e, pior, faz o KuzuDB travar em vez de simplesmente devolver zero resultados.
+	const normalizedPath = folderPath
+		.replace(/\\/g, '/')
+		.replace(/^([a-z]):/, (_match, drive: string) => `${drive.toUpperCase()}:`)
+		.replace(/'/g, "\\'");
+	// Pede um a mais que o teto de exibição só pra saber se o resultado foi truncado.
+	const query =
+		`MATCH (a)-[r]->(b) WHERE a.path STARTS WITH '${normalizedPath}' AND b.path STARTS WITH '${normalizedPath}' ` +
+		`RETURN a.name AS source, label(a) AS sourceType, type(r) AS relType, b.name AS target, label(b) AS targetType ` +
+		`LIMIT ${GRAPH_DISPLAY_LIMIT + 1}`;
+
+	const rawRows = await runQueryCommand(query, outputChannel);
+	if (!Array.isArray(rawRows)) {
+		throw new Error('Resposta inesperada do cgc query (não é uma lista).');
+	}
+
+	// Linhas que não têm o formato esperado são descartadas em vez de viraram nós/arestas
+	// quebrados (ex: com id "undefined") caso o formato de saída do CodeGraphContext mude.
+	const rows = rawRows.filter(isGraphRow);
+	const truncated = rows.length > GRAPH_DISPLAY_LIMIT;
+	if (truncated) {
+		rows.length = GRAPH_DISPLAY_LIMIT;
+	}
+
+	const nodeTypes = new Map<string, string>();
+	const edges: GraphEdge[] = [];
+
+	for (const row of rows) {
+		nodeTypes.set(row.source, row.sourceType);
+		nodeTypes.set(row.target, row.targetType);
+		edges.push({ source: row.source, target: row.target, type: row.relType });
+	}
+
+	const nodes = Array.from(nodeTypes.entries()).map(([id, type]) => ({ id, type }));
+	return { nodes, edges, truncated };
+}
+
+function createVisualizeRepositoryFlow(
+	context: vscode.ExtensionContext,
+	outputChannel: vscode.OutputChannel,
+	graphViewProvider: GraphViewProvider,
+): (folderPath: string) => Promise<void> {
+	// Contador de "última requisição": se o usuário clicar em visualizar um repositório
+	// diferente antes da consulta anterior terminar, o resultado desatualizado é descartado
+	// em vez de sobrescrever o painel por cima do que foi pedido por último.
+	let latestRequestId = 0;
+
+	return async function visualizeRepositoryFlow(folderPath: string): Promise<void> {
+		const status = getStatuses(context)[folderPath];
+		if (status !== 'indexed') {
+			vscode.window.showInformationMessage('Este repositório ainda não foi indexado — indexe antes de visualizar.');
+			return;
+		}
+
+		const requestId = ++latestRequestId;
+
+		try {
+			outputChannel.appendLine(`\n> Consultando grafo de: ${folderPath}`);
+			const { nodes, edges, truncated } = await fetchGraphData(folderPath, outputChannel);
+			if (requestId !== latestRequestId) {
+				return;
+			}
+			outputChannel.appendLine(`Grafo carregado: ${nodes.length} nós, ${edges.length} conexões.`);
+			await vscode.commands.executeCommand('repograph.graphView.focus');
+			graphViewProvider.showGraph(nodes, edges);
+			if (truncated) {
+				vscode.window.showWarningMessage(
+					`Grafo muito grande — mostrando um recorte parcial (${GRAPH_DISPLAY_LIMIT} relações).`,
+				);
+			}
+		} catch (error) {
+			if (requestId !== latestRequestId) {
+				return;
+			}
+			const message = error instanceof Error ? error.message : String(error);
+			outputChannel.appendLine(`Erro ao consultar grafo: ${message}`);
+			vscode.window.showErrorMessage(`Não foi possível carregar a visualização 3D: ${message}`);
+		}
+	};
 }
 
 function isEngineInstalled(): Promise<boolean> {
@@ -183,6 +437,11 @@ export function activate(context: vscode.ExtensionContext) {
 
 	const treeProvider = new RepositoryTreeProvider(context);
 	context.subscriptions.push(vscode.window.registerTreeDataProvider('repograph.repositoriesView', treeProvider));
+
+	const graphViewProvider = new GraphViewProvider(context.extensionUri);
+	context.subscriptions.push(vscode.window.registerWebviewViewProvider('repograph.graphView', graphViewProvider));
+
+	const visualizeRepositoryFlow = createVisualizeRepositoryFlow(context, outputChannel, graphViewProvider);
 
 	void warnIfEngineMissing();
 
@@ -272,6 +531,32 @@ export function activate(context: vscode.ExtensionContext) {
 		outputChannel.show(true);
 	});
 
+	const visualizeRepository = vscode.commands.registerCommand('repograph.visualizeRepository', async () => {
+		const repositories = getRepositories(context);
+
+		if (repositories.length === 0) {
+			vscode.window.showInformationMessage('Nenhum repositório cadastrado.');
+			return;
+		}
+
+		const folderPath = await vscode.window.showQuickPick(repositories, {
+			placeHolder: 'Escolha o repositório para visualizar em 3D',
+		});
+
+		if (!folderPath) {
+			return;
+		}
+
+		await visualizeRepositoryFlow(folderPath);
+	});
+
+	const visualizeRepositoryItem = vscode.commands.registerCommand(
+		'repograph.visualizeRepositoryItem',
+		async (folderPath: string) => {
+			await visualizeRepositoryFlow(folderPath);
+		},
+	);
+
 	const configureMcp = vscode.commands.registerCommand('repograph.configureMcp', () => {
 		// O motor já fala MCP sozinho (um único servidor cobre todos os repositórios
 		// indexados), então aqui só orientamos o assistente oficial de configuração
@@ -287,6 +572,8 @@ export function activate(context: vscode.ExtensionContext) {
 		removeRepository,
 		removeRepositoryItem,
 		revealOutput,
+		visualizeRepository,
+		visualizeRepositoryItem,
 		configureMcp,
 	);
 }

@@ -24,7 +24,7 @@ const esbuildProblemMatcherPlugin = {
 };
 
 async function main() {
-	const ctx = await esbuild.context({
+	const extensionCtx = await esbuild.context({
 		entryPoints: [
 			'src/extension.ts'
 		],
@@ -42,11 +42,34 @@ async function main() {
 			esbuildProblemMatcherPlugin,
 		],
 	});
+
+	// Bundle separado para o código que roda dentro do painel webview (navegador,
+	// não Node — por isso platform 'browser' e sem external de 'vscode').
+	const webviewCtx = await esbuild.context({
+		entryPoints: [
+			'src/webview/graph.js'
+		],
+		bundle: true,
+		format: 'iife',
+		minify: production,
+		sourcemap: !production,
+		sourcesContent: false,
+		platform: 'browser',
+		outfile: 'dist/webview/graph.js',
+		logLevel: 'silent',
+		plugins: [
+			esbuildProblemMatcherPlugin,
+		],
+	});
+
 	if (watch) {
-		await ctx.watch();
+		await extensionCtx.watch();
+		await webviewCtx.watch();
 	} else {
-		await ctx.rebuild();
-		await ctx.dispose();
+		await extensionCtx.rebuild();
+		await webviewCtx.rebuild();
+		await extensionCtx.dispose();
+		await webviewCtx.dispose();
 	}
 }
 
