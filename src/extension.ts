@@ -2,13 +2,28 @@
 // Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
 import { spawn } from 'child_process';
+import { friendlyEngineError, isEngineVersionSufficient, parseEngineVersion, MIN_ENGINE_VERSION } from './engineErrors';
+import { EngineGate } from './engineGate';
+import { McpClient, McpExitInfo } from './mcpClient';
 
 const REPOSITORIES_KEY = 'repograph.repositories';
 const STATUS_KEY = 'repograph.status';
+const WATCH_KEY = 'repograph.watchState';
 const ENGINE_COMMAND = 'cgc';
 const ENGINE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutos
 
 type RepoStatus = 'pending' | 'indexed' | 'error';
+type WatchState = 'off' | 'starting' | 'watching' | 'error';
+
+// Conexão persistente com `cgc mcp start`, usada só enquanto pelo menos um
+// repositório está em modo watch. Precisa ser module-level (não local a
+// activate()) para que deactivate() consiga encerrá-la de forma graciosa.
+const engineGate = new EngineGate();
+let mcpClient: McpClient | undefined;
+// Hook para a tree view se atualizar a partir de código que roda "abaixo" da UI
+// (ex: ensureMcpClientForRoots, chamado de dentro de withEngine) sem precisar
+// threadar o RepositoryTreeProvider por todas as funções de baixo nível.
+let refreshRepositoriesView: (() => void) | undefined;
 
 interface GraphNode {
 	id: string;
@@ -41,6 +56,38 @@ async function clearStatus(context: vscode.ExtensionContext, folderPath: string)
 	await context.globalState.update(STATUS_KEY, statuses);
 }
 
+function getWatchStates(context: vscode.ExtensionContext): Record<string, WatchState> {
+	return context.globalState.get<Record<string, WatchState>>(WATCH_KEY, {});
+}
+
+async function setWatchState(context: vscode.ExtensionContext, folderPath: string, state: WatchState): Promise<void> {
+	const states = getWatchStates(context);
+	states[folderPath] = state;
+	await context.globalState.update(WATCH_KEY, states);
+}
+
+async function clearWatchState(context: vscode.ExtensionContext, folderPath: string): Promise<void> {
+	const states = getWatchStates(context);
+	delete states[folderPath];
+	await context.globalState.update(WATCH_KEY, states);
+}
+
+function getWatchingPaths(context: vscode.ExtensionContext): string[] {
+	return Object.entries(getWatchStates(context))
+		.filter(([, state]) => state === 'watching')
+		.map(([path]) => path);
+}
+
+function getActiveWatchPaths(context: vscode.ExtensionContext): string[] {
+	return Object.entries(getWatchStates(context))
+		.filter(([, state]) => state === 'watching' || state === 'starting')
+		.map(([path]) => path);
+}
+
+function isWatchModeActive(context: vscode.ExtensionContext): boolean {
+	return getActiveWatchPaths(context).length > 0;
+}
+
 class RepositoryTreeProvider implements vscode.TreeDataProvider<string> {
 	private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
 	readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -54,14 +101,29 @@ class RepositoryTreeProvider implements vscode.TreeDataProvider<string> {
 	getTreeItem(folderPath: string): vscode.TreeItem {
 		const status = getStatuses(this.context)[folderPath] ?? 'pending';
 		const statusLabel = { pending: 'pendente', indexed: 'indexado', error: 'erro' }[status];
+		const watch = getWatchStates(this.context)[folderPath] ?? 'off';
+		const watchSuffix = {
+			off: '',
+			starting: ' · sincronizando',
+			watching: ' · observando',
+			error: ' · watch com erro',
+		}[watch];
 
 		const item = new vscode.TreeItem(folderPath.split(/[\\/]/).pop() ?? folderPath);
-		item.description = statusLabel;
+		item.description = statusLabel + watchSuffix;
 		item.tooltip = folderPath;
 		item.iconPath = new vscode.ThemeIcon(
-			status === 'indexed' ? 'check' : status === 'error' ? 'error' : 'clock',
+			watch === 'watching'
+				? 'eye'
+				: watch === 'starting'
+					? 'sync~spin'
+					: status === 'indexed'
+						? 'check'
+						: status === 'error'
+							? 'error'
+							: 'clock',
 		);
-		item.contextValue = 'repository';
+		item.contextValue = watch === 'watching' || watch === 'starting' ? 'repository.watching' : 'repository';
 		item.command = { command: 'repograph.revealOutput', title: 'Ver log', arguments: [] };
 		return item;
 	}
@@ -129,15 +191,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:var(--vscode-edit
 	}
 }
 
-function friendlyEngineError(stderr: string): string {
-	if (stderr.includes('Could not set lock on file')) {
-		// KuzuDB (banco embutido, tipo SQLite) só aceita uma conexão por vez.
-		return 'O banco de dados está em uso por outra operação do cgc. Tente de novo em alguns segundos.';
-	}
-	return stderr.trim();
-}
-
-function runEngineCommand(args: string[], outputChannel: vscode.OutputChannel): Promise<void> {
+function runEngineCommandSpawn(args: string[], outputChannel: vscode.OutputChannel): Promise<void> {
 	return new Promise((resolve, reject) => {
 		outputChannel.show(true);
 		outputChannel.appendLine(`\n> cgc ${args.join(' ')}`);
@@ -183,17 +237,220 @@ function runEngineCommand(args: string[], outputChannel: vscode.OutputChannel): 
 	});
 }
 
-async function indexRepository(folderPath: string, outputChannel: vscode.OutputChannel): Promise<void> {
-	await runEngineCommand(['index', folderPath], outputChannel);
+async function getMcpCwd(context: vscode.ExtensionContext): Promise<string> {
+	// CGC_ALLOWED_ROOTS é a única fonte de verdade de paths permitidos — o cwd do
+	// processo também conta como root implícito do lado do motor, então fixamos
+	// num diretório da própria extensão para não depender de onde o VSCode foi aberto.
+	await vscode.workspace.fs.createDirectory(context.globalStorageUri);
+	return context.globalStorageUri.fsPath;
+}
+
+function isSupersetOf(set: ReadonlySet<string>, subset: ReadonlySet<string>): boolean {
+	for (const item of subset) {
+		if (!set.has(item)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+async function handleUnexpectedMcpExit(
+	context: vscode.ExtensionContext,
+	outputChannel: vscode.OutputChannel,
+	info: McpExitInfo,
+): Promise<void> {
+	mcpClient = undefined;
+	if (info.expected) {
+		return;
+	}
+	const message = friendlyEngineError(info.stderrTail) || 'A conexão com o motor foi encerrada inesperadamente.';
+	outputChannel.appendLine(`\nAuto-atualização caiu inesperadamente: ${message}`);
+
+	const affected = getActiveWatchPaths(context);
+	for (const path of affected) {
+		await setWatchState(context, path, 'error');
+	}
+	refreshRepositoriesView?.();
+
+	if (affected.length > 0) {
+		vscode.window.showErrorMessage(`Auto-atualização parou inesperadamente: ${message}`);
+	}
+}
+
+async function ensureMcpClientForRoots(
+	context: vscode.ExtensionContext,
+	outputChannel: vscode.OutputChannel,
+): Promise<McpClient> {
+	const desired = new Set(getRepositories(context));
+
+	if (mcpClient?.isAlive && isSupersetOf(mcpClient.allowedRoots, desired)) {
+		return mcpClient;
+	}
+
+	if (mcpClient) {
+		outputChannel.appendLine('\nReiniciando conexão de auto-atualização para atualizar permissões de caminho...');
+		await mcpClient.shutdown();
+		mcpClient = undefined;
+	}
+
+	if (!(await checkEngineSupportsWatch(outputChannel))) {
+		throw new Error(`Auto-atualização exige codegraphcontext ${MIN_ENGINE_VERSION} ou mais recente.`);
+	}
+
+	const client = new McpClient({
+		command: ENGINE_COMMAND,
+		cwd: await getMcpCwd(context),
+		allowedRoots: [...desired],
+		outputChannel,
+	});
+	client.onDidExit((info) => void handleUnexpectedMcpExit(context, outputChannel, info));
+
+	outputChannel.appendLine('\n> cgc mcp start (auto-atualização)');
+	await client.start();
+	mcpClient = client;
+
+	// Sempre reaplica watch_directory para tudo que já está 'watching' no estado
+	// persistido — cobre tanto reinício por causa de roots novos (paths de sessões
+	// anteriores deste mesmo processo) quanto retomada na inicialização da extensão
+	// (processo novo nunca viu esses paths).
+	for (const path of getWatchingPaths(context)) {
+		try {
+			await client.callTool('watch_directory', { repo_path: path });
+		} catch (error) {
+			await setWatchState(context, path, 'error');
+			const message = error instanceof Error ? error.message : String(error);
+			outputChannel.appendLine(`Aviso: falha ao restabelecer watch para ${path.split(/[\\/]/).pop()}: ${message}`);
+		}
+	}
+	refreshRepositoriesView?.();
+	return mcpClient;
+}
+
+interface EngineOperation<T> {
+	viaSpawn: () => Promise<T>;
+	viaMcp: (client: McpClient) => Promise<T>;
+}
+
+async function withEngine<T>(
+	context: vscode.ExtensionContext,
+	outputChannel: vscode.OutputChannel,
+	op: EngineOperation<T>,
+): Promise<T> {
+	return engineGate.run(async () => {
+		if (isWatchModeActive(context)) {
+			const client = await ensureMcpClientForRoots(context, outputChannel);
+			return op.viaMcp(client);
+		}
+		if (mcpClient) {
+			// Nenhum repositório em watch neste momento, mas a conexão de uma operação
+			// anterior ainda está viva — encerra antes de cair no spawn curto, para não
+			// segurar o lock do banco sem necessidade.
+			const client = mcpClient;
+			mcpClient = undefined;
+			await client.shutdown();
+		}
+		return op.viaSpawn();
+	});
+}
+
+interface JobStatus {
+	status?: string;
+	processed_files?: number;
+	total_files?: number;
+	error?: string;
+}
+
+async function pollJobUntilDone(client: McpClient, jobId: string, outputChannel: vscode.OutputChannel): Promise<void> {
+	const start = Date.now();
+	let lastProgress = '';
+	while (Date.now() - start < ENGINE_TIMEOUT_MS) {
+		const job = await client.callTool<JobStatus>('check_job_status', { job_id: jobId });
+		const progress = `${job.processed_files ?? '?'}/${job.total_files ?? '?'}`;
+		if (progress !== lastProgress) {
+			outputChannel.appendLine(`Progresso da indexação inicial: ${progress} arquivos`);
+			lastProgress = progress;
+		}
+		if (job.status === 'completed') {
+			return;
+		}
+		if (job.status === 'failed' || job.status === 'cancelled') {
+			throw new Error(job.error ?? `Job de indexação ${job.status === 'failed' ? 'falhou' : 'foi cancelado'}.`);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 1500));
+	}
+	throw new Error(`Indexação inicial excedeu o tempo limite de ${ENGINE_TIMEOUT_MS / 1000}s.`);
+}
+
+async function indexRepository(
+	context: vscode.ExtensionContext,
+	folderPath: string,
+	outputChannel: vscode.OutputChannel,
+): Promise<void> {
+	await withEngine(context, outputChannel, {
+		viaSpawn: () => runEngineCommandSpawn(['index', folderPath], outputChannel),
+		viaMcp: async (client) => {
+			const res = await client.callTool<{ job_id?: string; message?: string }>('add_code_to_graph', {
+				repo_path: folderPath,
+			});
+			if (res.message) {
+				outputChannel.appendLine(res.message);
+			}
+			if (res.job_id) {
+				await pollJobUntilDone(client, res.job_id, outputChannel);
+			}
+		},
+	});
 	outputChannel.appendLine(`Indexação concluída: ${folderPath}`);
 }
 
-async function deleteRepositoryIndex(folderPath: string, outputChannel: vscode.OutputChannel): Promise<void> {
-	await runEngineCommand(['delete', folderPath], outputChannel);
+async function deleteRepositoryIndex(
+	context: vscode.ExtensionContext,
+	folderPath: string,
+	outputChannel: vscode.OutputChannel,
+): Promise<void> {
+	await withEngine(context, outputChannel, {
+		viaSpawn: () => runEngineCommandSpawn(['delete', folderPath], outputChannel),
+		viaMcp: async (client) => {
+			const res = await client.callTool<{ message?: string }>('delete_repository', { repo_path: folderPath });
+			if (res.message) {
+				outputChannel.appendLine(res.message);
+			}
+		},
+	});
 	outputChannel.appendLine(`Índice removido do code graph: ${folderPath}`);
 }
 
-function runQueryCommand(query: string, outputChannel: vscode.OutputChannel): Promise<unknown[]> {
+interface CypherQueryResult {
+	success?: boolean;
+	results?: unknown[];
+	truncated?: boolean;
+	notice?: string;
+}
+
+async function executeCypherQuery(
+	context: vscode.ExtensionContext,
+	query: string,
+	outputChannel: vscode.OutputChannel,
+): Promise<unknown[]> {
+	return withEngine(context, outputChannel, {
+		viaSpawn: () => runQueryCommandSpawn(query, outputChannel),
+		viaMcp: async (client) => {
+			const res = await client.callTool<CypherQueryResult>('execute_cypher_query', { cypher_query: query });
+			if (!Array.isArray(res.results)) {
+				if (res.truncated) {
+					throw new Error(
+						res.notice ??
+							'A resposta da consulta foi truncada pelo motor (configuração MAX_TOOL_RESPONSE_TOKENS) antes de virar uma lista completa de resultados.',
+					);
+				}
+				throw new Error('Resposta inesperada do execute_cypher_query (não é uma lista).');
+			}
+			return res.results;
+		},
+	});
+}
+
+function runQueryCommandSpawn(query: string, outputChannel: vscode.OutputChannel): Promise<unknown[]> {
 	return new Promise((resolve, reject) => {
 		outputChannel.appendLine(`\n> cgc query ${query}`);
 
@@ -283,6 +540,7 @@ function isGraphRow(row: unknown): row is GraphRow {
 }
 
 async function fetchGraphData(
+	context: vscode.ExtensionContext,
 	folderPath: string,
 	outputChannel: vscode.OutputChannel,
 ): Promise<{ nodes: GraphNode[]; edges: GraphEdge[]; truncated: boolean }> {
@@ -300,7 +558,7 @@ async function fetchGraphData(
 		`RETURN a.name AS source, label(a) AS sourceType, type(r) AS relType, b.name AS target, label(b) AS targetType ` +
 		`LIMIT ${GRAPH_DISPLAY_LIMIT + 1}`;
 
-	const rawRows = await runQueryCommand(query, outputChannel);
+	const rawRows = await executeCypherQuery(context, query, outputChannel);
 	if (!Array.isArray(rawRows)) {
 		throw new Error('Resposta inesperada do cgc query (não é uma lista).');
 	}
@@ -347,7 +605,7 @@ function createVisualizeRepositoryFlow(
 
 		try {
 			outputChannel.appendLine(`\n> Consultando grafo de: ${folderPath}`);
-			const { nodes, edges, truncated } = await fetchGraphData(folderPath, outputChannel);
+			const { nodes, edges, truncated } = await fetchGraphData(context, folderPath, outputChannel);
 			if (requestId !== latestRequestId) {
 				return;
 			}
@@ -378,23 +636,187 @@ function isEngineInstalled(): Promise<boolean> {
 	});
 }
 
+function getEngineVersion(): Promise<string | null> {
+	return new Promise((resolve) => {
+		// `cgc --version` imprime no stderr (Console(stderr=True) do lado do motor).
+		const child = spawn(ENGINE_COMMAND, ['--version'], { shell: false });
+		let stderr = '';
+		child.stderr.on('data', (data: Buffer) => (stderr += data.toString()));
+		child.on('error', () => resolve(null));
+		child.on('close', (code) => resolve(code === 0 ? stderr : null));
+	});
+}
+
+async function checkEngineSupportsWatch(outputChannel: vscode.OutputChannel): Promise<boolean> {
+	const versionOutput = await getEngineVersion();
+	const version = versionOutput ? parseEngineVersion(versionOutput) : null;
+	// Só bloqueia quando a versão foi identificada com confiança e é comprovadamente
+	// antiga — se não der para determinar (regex não bateu, saída inesperada), segue
+	// em frente por padrão em vez de travar a feature por uma checagem de melhor esforço.
+	if (version && !isEngineVersionSufficient(version)) {
+		const versionLabel = version.join('.');
+		outputChannel.appendLine(
+			`Erro: cgc na versão ${versionLabel} não suporta auto-atualização (mínimo: ${MIN_ENGINE_VERSION}).`,
+		);
+		vscode.window.showErrorMessage(
+			`Auto-atualização (watch) exige codegraphcontext ${MIN_ENGINE_VERSION} ou mais recente (detectado: ${versionLabel}). Atualize com "pip install --upgrade codegraphcontext".`,
+		);
+		return false;
+	}
+	return true;
+}
+
+async function enableWatchFlow(
+	context: vscode.ExtensionContext,
+	treeProvider: RepositoryTreeProvider,
+	outputChannel: vscode.OutputChannel,
+	folderPath: string,
+): Promise<void> {
+	await setWatchState(context, folderPath, 'starting');
+	treeProvider.refresh();
+
+	try {
+		await withEngine(context, outputChannel, {
+			viaSpawn: () => {
+				throw new Error('Estado interno inconsistente: watch ativo deveria sempre rotear pela conexão MCP.');
+			},
+			viaMcp: async (client) => {
+				const res = await client.callTool<{ job_id?: string; message?: string }>('watch_directory', {
+					repo_path: folderPath,
+				});
+				if (res.message) {
+					outputChannel.appendLine(res.message);
+				}
+				if (res.job_id) {
+					await pollJobUntilDone(client, res.job_id, outputChannel);
+					await setStatus(context, folderPath, 'indexed');
+				}
+			},
+		});
+		await setWatchState(context, folderPath, 'watching');
+		vscode.window.showInformationMessage(`Auto-atualização ativada: ${folderPath}`);
+	} catch (error) {
+		await setWatchState(context, folderPath, 'error');
+		const message = error instanceof Error ? error.message : String(error);
+		outputChannel.appendLine(`Erro ao ativar auto-atualização: ${message}`);
+		vscode.window.showErrorMessage(`Não foi possível ativar auto-atualização: ${message}`);
+	} finally {
+		treeProvider.refresh();
+	}
+}
+
+async function disableWatchFlow(
+	context: vscode.ExtensionContext,
+	treeProvider: RepositoryTreeProvider,
+	outputChannel: vscode.OutputChannel,
+	folderPath: string,
+): Promise<void> {
+	try {
+		await withEngine(context, outputChannel, {
+			viaSpawn: async () => {
+				// Sem conexão MCP viva não há watch ativo para este path — nada a fazer.
+			},
+			viaMcp: async (client) => {
+				const res = await client.callTool<{ message?: string }>('unwatch_directory', { repo_path: folderPath });
+				if (res.message) {
+					outputChannel.appendLine(res.message);
+				}
+			},
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		outputChannel.appendLine(`Aviso: falha ao desativar auto-atualização: ${message}`);
+	} finally {
+		await setWatchState(context, folderPath, 'off');
+		treeProvider.refresh();
+
+		// Se este era o último repositório observado, encerra a conexão persistente
+		// já — sem esperar pela próxima operação — para soltar o lock do banco assim
+		// que possível (reduz a janela de colisão com o assistente de IA do usuário).
+		if (!isWatchModeActive(context) && mcpClient) {
+			const client = mcpClient;
+			mcpClient = undefined;
+			await client.shutdown();
+		}
+	}
+}
+
+async function resumeWatchesOnStartup(
+	context: vscode.ExtensionContext,
+	treeProvider: RepositoryTreeProvider,
+	outputChannel: vscode.OutputChannel,
+): Promise<void> {
+	const toResume = getWatchingPaths(context);
+	if (toResume.length === 0) {
+		return;
+	}
+	if (!(await isEngineInstalled())) {
+		for (const path of toResume) {
+			await setWatchState(context, path, 'error');
+		}
+		treeProvider.refresh();
+		return;
+	}
+
+	for (const path of toResume) {
+		await setWatchState(context, path, 'starting');
+	}
+	treeProvider.refresh();
+
+	try {
+		await withEngine(context, outputChannel, {
+			viaSpawn: () => {
+				throw new Error('Estado interno inconsistente: watch ativo deveria sempre rotear pela conexão MCP.');
+			},
+			viaMcp: async (client) => {
+				for (const path of toResume) {
+					try {
+						await client.callTool('watch_directory', { repo_path: path });
+						await setWatchState(context, path, 'watching');
+					} catch (error) {
+						await setWatchState(context, path, 'error');
+						const message = error instanceof Error ? error.message : String(error);
+						outputChannel.appendLine(
+							`Aviso: falha ao retomar auto-atualização de ${path.split(/[\\/]/).pop()}: ${message}`,
+						);
+					}
+				}
+			},
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		outputChannel.appendLine(`Aviso: falha ao retomar auto-atualização na inicialização: ${message}`);
+		for (const path of toResume) {
+			await setWatchState(context, path, 'error');
+		}
+	} finally {
+		treeProvider.refresh();
+	}
+}
+
 async function removeRepositoryFlow(
 	context: vscode.ExtensionContext,
 	treeProvider: RepositoryTreeProvider,
 	outputChannel: vscode.OutputChannel,
 	folderPath: string,
 ): Promise<void> {
+	const watchState = getWatchStates(context)[folderPath] ?? 'off';
+	if (watchState === 'watching' || watchState === 'starting') {
+		await disableWatchFlow(context, treeProvider, outputChannel, folderPath);
+	}
+
 	const repositories = getRepositories(context);
 	await context.globalState.update(
 		REPOSITORIES_KEY,
 		repositories.filter((repo) => repo !== folderPath),
 	);
 	await clearStatus(context, folderPath);
+	await clearWatchState(context, folderPath);
 	treeProvider.refresh();
 	vscode.window.showInformationMessage(`Repositório removido da lista: ${folderPath}`);
 
 	try {
-		await deleteRepositoryIndex(folderPath, outputChannel);
+		await deleteRepositoryIndex(context, folderPath, outputChannel);
 		vscode.window.showInformationMessage(`Índice removido do code graph: ${folderPath}`);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -437,6 +859,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 	const treeProvider = new RepositoryTreeProvider(context);
 	context.subscriptions.push(vscode.window.registerTreeDataProvider('repograph.repositoriesView', treeProvider));
+	refreshRepositoriesView = () => treeProvider.refresh();
 
 	const graphViewProvider = new GraphViewProvider(context.extensionUri);
 	context.subscriptions.push(vscode.window.registerWebviewViewProvider('repograph.graphView', graphViewProvider));
@@ -480,7 +903,7 @@ export function activate(context: vscode.ExtensionContext) {
 		vscode.window.showInformationMessage(`Repositório adicionado: ${folderPath}`);
 
 		try {
-			await indexRepository(folderPath, outputChannel);
+			await indexRepository(context, folderPath, outputChannel);
 			await setStatus(context, folderPath, 'indexed');
 			vscode.window.showInformationMessage(`Repositório indexado: ${folderPath}`);
 		} catch (error) {
@@ -566,6 +989,20 @@ export function activate(context: vscode.ExtensionContext) {
 		terminal.sendText(`${ENGINE_COMMAND} mcp setup`);
 	});
 
+	const enableWatchItem = vscode.commands.registerCommand(
+		'repograph.enableWatchItem',
+		async (folderPath: string) => {
+			await enableWatchFlow(context, treeProvider, outputChannel, folderPath);
+		},
+	);
+
+	const disableWatchItem = vscode.commands.registerCommand(
+		'repograph.disableWatchItem',
+		async (folderPath: string) => {
+			await disableWatchFlow(context, treeProvider, outputChannel, folderPath);
+		},
+	);
+
 	context.subscriptions.push(
 		disposable,
 		addRepository,
@@ -575,8 +1012,15 @@ export function activate(context: vscode.ExtensionContext) {
 		visualizeRepository,
 		visualizeRepositoryItem,
 		configureMcp,
+		enableWatchItem,
+		disableWatchItem,
 	);
+
+	void resumeWatchesOnStartup(context, treeProvider, outputChannel);
 }
 
 // This method is called when your extension is deactivated
-export function deactivate() {}
+export function deactivate(): Thenable<void> | undefined {
+	refreshRepositoriesView = undefined;
+	return mcpClient?.shutdown();
+}

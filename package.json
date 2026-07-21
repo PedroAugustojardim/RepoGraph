@@ -3,7 +3,7 @@
   "displayName": "RepoGraph",
   "publisher": "repograph",
   "description": "Central de repositorios para IA: indexa seus projetos com CodeGraphContext (MCP) e da contexto de codigo pronto para Claude Code, Cursor e Copilot.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "icon": "images/icon.png",
   "engines": {
     "vscode": "^1.125.0"
@@ -63,6 +63,16 @@
         "command": "repograph.visualizeRepositoryItem",
         "title": "RepoGraph: Visualizar este repositório em 3D",
         "icon": "$(graph)"
+      },
+      {
+        "command": "repograph.enableWatchItem",
+        "title": "RepoGraph: Ativar auto-atualização (watch)",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "repograph.disableWatchItem",
+        "title": "RepoGraph: Desativar auto-atualização (watch)",
+        "icon": "$(eye-closed)"
       }
     ],
     "viewsContainers": {
@@ -92,6 +102,16 @@
     "menus": {
       "view/item/context": [
         {
+          "command": "repograph.enableWatchItem",
+          "when": "view == repograph.repositoriesView && viewItem == repository",
+          "group": "inline@0"
+        },
+        {
+          "command": "repograph.disableWatchItem",
+          "when": "view == repograph.repositoriesView && viewItem == repository.watching",
+          "group": "inline@0"
+        },
+        {
           "command": "repograph.visualizeRepositoryItem",
           "when": "view == repograph.repositoriesView",
           "group": "inline@1"
@@ -113,6 +133,14 @@
         },
         {
           "command": "repograph.visualizeRepositoryItem",
+          "when": "false"
+        },
+        {
+          "command": "repograph.enableWatchItem",
+          "when": "false"
+        },
+        {
+          "command": "repograph.disableWatchItem",
           "when": "false"
         }
       ]
