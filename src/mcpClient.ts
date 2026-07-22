@@ -69,6 +69,7 @@ export class McpClient {
 	private stderrTail = '';
 	private expectedExit = false;
 	private started = false;
+	private exitHandled = false;
 
 	constructor(options: McpClientOptions) {
 		this.options = {
@@ -122,6 +123,14 @@ export class McpClient {
 			this.stderrTail = (this.stderrTail + text).slice(-STDERR_TAIL_LIMIT);
 			this.options.outputChannel.appendLine(text.trimEnd());
 		});
+
+		// Sem esses listeners, um erro nos streams (ex: EPIPE ao escrever no stdin
+		// depois que o processo já morreu — janela real entre o isAlive check em
+		// callTool() e o child.stdin.write() alguns ticks depois) seria um evento
+		// 'error' sem handler, que o Node relança como exceção não tratada e derruba
+		// o extension host inteiro. O 'close' (via handleExit) já cobre a limpeza.
+		child.stdin.on('error', () => undefined);
+		child.stdout.on('error', () => undefined);
 
 		let settleStart: ((error?: Error) => void) | undefined;
 		const startResult = new Promise<void>((resolve, reject) => {
@@ -303,9 +312,13 @@ export class McpClient {
 	}
 
 	private handleExit(code: number | null): void {
-		if (!this.started) {
+		if (!this.started || this.exitHandled) {
 			return;
 		}
+		// Node pode emitir 'error' e 'close' para a mesma falha subjacente (ex: o
+		// processo não conseguiu nem ser criado) — sem essa trava, os listeners de
+		// onDidExit seriam notificados duas vezes para um único evento real.
+		this.exitHandled = true;
 		const info: McpExitInfo = { code, expected: this.expectedExit, stderrTail: this.stderrTail };
 		for (const [, entry] of this.pending) {
 			entry.reject(new Error(friendlyEngineError(this.stderrTail) || 'A conexão com o motor foi encerrada.'));

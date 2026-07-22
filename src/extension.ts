@@ -353,18 +353,28 @@ async function withEngine<T>(
 	});
 }
 
-interface JobStatus {
+interface JobInfo {
 	status?: string;
 	processed_files?: number;
 	total_files?: number;
-	error?: string;
+	errors?: string[];
+}
+
+interface CheckJobStatusResult {
+	// Caso normal: os dados do job vêm aninhados em "job" (nunca no nível raiz).
+	job?: JobInfo;
+	// Caso "job não encontrado" (ex: servidor reiniciou e perdeu o estado em memória):
+	// vem achatado, sem a chave "job" — só "status": "not_found" + "message" no topo.
+	status?: string;
+	message?: string;
 }
 
 async function pollJobUntilDone(client: McpClient, jobId: string, outputChannel: vscode.OutputChannel): Promise<void> {
 	const start = Date.now();
 	let lastProgress = '';
 	while (Date.now() - start < ENGINE_TIMEOUT_MS) {
-		const job = await client.callTool<JobStatus>('check_job_status', { job_id: jobId });
+		const res = await client.callTool<CheckJobStatusResult>('check_job_status', { job_id: jobId });
+		const job = res.job ?? { status: res.status };
 		const progress = `${job.processed_files ?? '?'}/${job.total_files ?? '?'}`;
 		if (progress !== lastProgress) {
 			outputChannel.appendLine(`Progresso da indexação inicial: ${progress} arquivos`);
@@ -374,7 +384,11 @@ async function pollJobUntilDone(client: McpClient, jobId: string, outputChannel:
 			return;
 		}
 		if (job.status === 'failed' || job.status === 'cancelled') {
-			throw new Error(job.error ?? `Job de indexação ${job.status === 'failed' ? 'falhou' : 'foi cancelado'}.`);
+			const detail = job.errors && job.errors.length > 0 ? job.errors.join('; ') : undefined;
+			throw new Error(detail ?? `Job de indexação ${job.status === 'failed' ? 'falhou' : 'foi cancelado'}.`);
+		}
+		if (job.status === 'not_found') {
+			throw new Error(res.message ?? `Job de indexação '${jobId}' não foi encontrado.`);
 		}
 		await new Promise((resolve) => setTimeout(resolve, 1500));
 	}
